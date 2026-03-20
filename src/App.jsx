@@ -1,7 +1,40 @@
 import { useState, useCallback, useMemo } from "react";
 
-/* ── Format Detection & Parsing ── */
+/* ── Shift Definitions ── */
+const SHIFTS = {
+  早班: { start: 8, end: 17, label: "早班", color: "#f59e0b", bg: "#fef3c7", border: "#fcd34d" },
+  中班: { start: 16, end: 25, label: "中班", color: "#8b5cf6", bg: "#ede9fe", border: "#c4b5fd" }, // 25 = 01:00 next day
+  晚班: { start: 20, end: 32, label: "晚班", color: "#6366f1", bg: "#e0e7ff", border: "#a5b4fc" }, // 32 = 08:00 next day
+};
 
+function detectShift(times) {
+  // Always infer from first punch time — CSV shift names are unreliable
+  if (!times || times.length === 0) return null;
+  const [h] = times[0].split(":").map(Number);
+  // 早班 08:00~17:00 → first punch typically 06:00~09:59
+  if (h >= 5 && h < 10) return "早班";
+  // 中班 16:00~01:00 → first punch typically 14:00~19:59
+  if (h >= 14 && h < 20) return "中班";
+  // 晚班 20:00~08:00 → first punch 20:00+ or 00:00~04:59
+  if (h >= 20 || h < 5) return "晚班";
+  // 10:00~13:59 ambiguous, default to 早班
+  return "早班";
+}
+
+function isLateForShift(shift, firstH, firstM) {
+  const s = SHIFTS[shift];
+  if (!s) return false;
+  return firstH > s.start || (firstH === s.start && firstM > 0);
+}
+
+function isEarlyForShift(shift, lastH, lastM) {
+  if (shift === "早班") return lastH < 17;
+  if (shift === "中班") return lastH < 1 && lastH >= 0 ? false : lastH > 1 ? false : lastH < 1; // simplify: before 01:00
+  if (shift === "晚班") return false; // hard to detect across day boundary
+  return false;
+}
+
+/* ── Format Detection & Parsing ── */
 const HEADER_KEYWORDS = ["鼎永工業股份有限公司", "刷卡資料一覽表", "出勤日期：", "員工區間：", "員工代號"];
 const PAGE_BREAK = "NO.0080-A4-2";
 
@@ -22,7 +55,6 @@ function extractMonth(dateStr) {
   return d ? d.substring(0, 7) : null;
 }
 
-/* Format B: columnar CSV with header row (員工代號 in col 15) */
 function parseFormatB(text) {
   const lines = text.split("\n").filter(l => l.trim());
   if (lines.length < 2) return null;
@@ -46,12 +78,13 @@ function parseFormatB(text) {
     const date = normalizeDate(rawDate);
     const month = extractMonth(rawDate);
     if (!date || !month) continue;
-    records.push({ empId, empName, date, status, times: parseTimeString(rawTime), month });
+    const times = parseTimeString(rawTime);
+    const shift = status === "排班" ? detectShift(times) : null;
+    records.push({ empId, empName, date, status, times, month, shift });
   }
   return records.length > 0 ? records : null;
 }
 
-/* Format A: old report format (鼎永刷卡資料一覽表) */
 function parseFormatA(text) {
   const splitLine = (l) => l.includes("\t") ? l.split("\t") : l.split(",");
   const lines = text.split("\n").filter(l => l.trim()).map(splitLine);
@@ -77,7 +110,8 @@ function parseFormatA(text) {
     }
     if (date && status) {
       const month = monthLabel || extractMonth(date) || "";
-      records.push({ empId: currentId, empName: currentName, date, status, times, month });
+      const shift = status === "排班" ? detectShift(times) : null;
+      records.push({ empId: currentId, empName: currentName, date, status, times, month, shift });
     }
   }
   return records.length > 0 ? records : null;
@@ -85,15 +119,10 @@ function parseFormatA(text) {
 
 function parseAuto(rawText) {
   const text = rawText.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-  // Try format B first (has header with 員工代號)
-  const b = parseFormatB(text);
-  if (b) return b;
-  // Fallback to format A
-  return parseFormatA(text) || [];
+  return parseFormatB(text) || parseFormatA(text) || [];
 }
 
 /* ── Statistics ── */
-
 function processRecords(records) {
   const byEmp = {};
   for (const r of records) {
@@ -103,17 +132,17 @@ function processRecords(records) {
   }
   for (const emp of Object.values(byEmp)) {
     for (const data of Object.values(emp.months)) {
-      const s = { 排班: 0, 排休: 0, 未刷卡: 0, total: data.days.length };
+      const s = { 排班: 0, 排休: 0, 未刷卡: 0, total: data.days.length, 早班: 0, 中班: 0, 晚班: 0 };
       let late = 0, early = 0, totalMin = 0, workDays = 0;
       for (const d of data.days) {
-        if (d.status === "排班") s.排班++;
+        if (d.status === "排班") { s.排班++; if (d.shift) s[d.shift]++; }
         else if (d.status === "排休") s.排休++;
         if (d.status === "未刷卡") s.未刷卡++;
         if (d.times.length >= 2 && d.status === "排班") {
           const [fh, fm] = d.times[0].split(":").map(Number);
           const [lh, lm] = d.times[d.times.length - 1].split(":").map(Number);
-          if (fh > 8 || (fh === 8 && fm > 0)) late++;
-          if (lh < 17) early++;
+          if (d.shift && isLateForShift(d.shift, fh, fm)) late++;
+          if (d.shift === "早班" && lh < 17) early++;
           const dur = (lh * 60 + lm) - (fh * 60 + fm);
           if (dur > 0) { totalMin += dur; workDays++; }
         }
@@ -128,6 +157,11 @@ function processRecords(records) {
 }
 
 /* ── UI Components ── */
+function ShiftBadge({ shift }) {
+  if (!shift) return null;
+  const s = SHIFTS[shift] || { bg: "#f5f5f5", color: "#616161", border: "#bdbdbd", label: shift };
+  return <span style={{ display: "inline-block", padding: "1px 7px", borderRadius: 4, fontSize: 11, background: s.bg, color: s.color, border: `1px solid ${s.border}`, fontWeight: 600, marginLeft: 6 }}>{s.label}</span>;
+}
 
 function StatusBadge({ status }) {
   const m = {
@@ -141,7 +175,7 @@ function StatusBadge({ status }) {
 
 function StatCard({ label, value, sub, accent }) {
   return (
-    <div style={{ background: "var(--card-bg)", borderRadius: 10, padding: "14px 18px", border: "1px solid var(--border)", minWidth: 100, flex: "1 1 0" }}>
+    <div style={{ background: "var(--card-bg)", borderRadius: 10, padding: "14px 18px", border: "1px solid var(--border)", minWidth: 90, flex: "1 1 0" }}>
       <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 4, letterSpacing: 0.3 }}>{label}</div>
       <div style={{ fontSize: 26, fontWeight: 700, color: accent || "var(--text)", fontFamily: "'JetBrains Mono', monospace" }}>{value}</div>
       {sub && <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 2 }}>{sub}</div>}
@@ -152,7 +186,6 @@ function StatCard({ label, value, sub, accent }) {
 const DOW = ["日", "一", "二", "三", "四", "五", "六"];
 
 /* ── Main App ── */
-
 export default function AttendanceReport() {
   const [data, setData] = useState(null);
   const [selectedEmp, setSelectedEmp] = useState(null);
@@ -166,7 +199,6 @@ export default function AttendanceReport() {
     const fileList = Array.from(e.target.files);
     if (!fileList.length) return;
     setLoading(true); setError(null);
-
     try {
       const allRecords = [], names = [];
       for (const file of fileList) {
@@ -177,12 +209,10 @@ export default function AttendanceReport() {
         catch { text = new TextDecoder("big5").decode(ab); }
         allRecords.push(...parseAuto(text));
       }
-
       if (allRecords.length === 0) {
-        setError("解析到 0 筆記錄。支援兩種格式：\n① 鼎永刷卡資料一覽表（從 Excel 另存 CSV）\n② 含標頭列的出勤 CSV（員工代號/出勤日期/班表區分）");
+        setError("解析到 0 筆記錄。支援兩種格式：\n① 刷卡資料一覽表 CSV\n② 含標頭列的出勤 CSV（員工代號/出勤日期/班表區分）");
         setLoading(false); return;
       }
-
       const processed = processRecords(allRecords);
       setData(processed); setFileNames(names); setParsedCount(allRecords.length);
       const firstEmp = Object.keys(processed)[0];
@@ -215,7 +245,7 @@ export default function AttendanceReport() {
         .emp-item.active { background: var(--accent); color: #fff; font-weight: 600; }
         .mtab { padding: 6px 16px; border-radius: 20px; cursor: pointer; font-size: 13px; font-weight: 500; border: 1px solid var(--border); background: var(--card-bg); transition: all .15s; user-select: none; }
         .mtab:hover { border-color: var(--accent); } .mtab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
-        .drow { display: grid; grid-template-columns: 100px 64px 1fr; gap: 8px; padding: 8px 12px; border-radius: 6px; align-items: center; font-size: 13px; }
+        .drow { display: grid; grid-template-columns: 100px 64px 52px 1fr; gap: 8px; padding: 8px 12px; border-radius: 6px; align-items: center; font-size: 13px; }
         .drow:nth-child(even) { background: rgba(0,0,0,0.02); }
         .upzone { border: 2px dashed var(--border); border-radius: 12px; padding: 40px; text-align: center; cursor: pointer; transition: all .2s; }
         .upzone:hover { border-color: var(--accent); background: var(--accent-light); }
@@ -228,15 +258,14 @@ export default function AttendanceReport() {
               <div style={{ fontSize: 40, marginBottom: 8 }}>📋</div>
               <h1 style={{ fontSize: 22, fontWeight: 700, marginBottom: 8 }}>出勤狀況報表</h1>
               <p style={{ fontSize: 14, color: "var(--text-muted)" }}>上傳鼎永刷卡資料，自動產出每月出勤統計</p>
+              <div style={{ marginTop: 12, fontSize: 12, color: "var(--text-muted)", lineHeight: 1.8 }}>
+                班別自動判定：早班 08:00–17:00 ／ 中班 16:00–01:00 ／ 晚班 20:00–08:00
+              </div>
             </div>
             <label className="upzone" style={{ display: "block" }}>
               <input type="file" accept=".csv,.tsv,.txt" multiple onChange={handleFiles} style={{ display: "none" }} />
               <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 4 }}>{loading ? "解析中..." : "點擊上傳檔案"}</div>
-              <div style={{ fontSize: 12, color: "var(--text-muted)", lineHeight: 1.8 }}>
-                支援兩種格式（可多選）：<br/>
-                ① 刷卡資料一覽表 CSV<br/>
-                ② 含標頭列的出勤 CSV
-              </div>
+              <div style={{ fontSize: 12, color: "var(--text-muted)", lineHeight: 1.8 }}>支援 CSV / TSV（可多選多月份）</div>
             </label>
             {error && <div style={{ marginTop: 16, padding: 12, borderRadius: 8, background: "#fef2f2", color: "#dc2626", fontSize: 13, whiteSpace: "pre-wrap" }}>{error}</div>}
           </div>
@@ -282,18 +311,21 @@ export default function AttendanceReport() {
 
                 {cur && (
                   <>
-                    <div style={{ display: "flex", gap: 12, marginBottom: 20, flexWrap: "wrap" }}>
-                      <StatCard label="排班天數" value={cur.stats.排班} accent="var(--green)" />
-                      <StatCard label="排休天數" value={cur.stats.排休} accent="var(--accent)" />
+                    <div style={{ display: "flex", gap: 10, marginBottom: 20, flexWrap: "wrap" }}>
+                      <StatCard label="排班" value={cur.stats.排班} accent="var(--green)" />
+                      <StatCard label="排休" value={cur.stats.排休} accent="var(--accent)" />
                       <StatCard label="未刷卡" value={cur.stats.未刷卡} accent={cur.stats.未刷卡 > 0 ? "var(--red)" : undefined} />
-                      <StatCard label="遲到" value={cur.stats.lateCount} sub="08:00 後到" accent={cur.stats.lateCount > 0 ? "var(--orange)" : undefined} />
-                      <StatCard label="早退" value={cur.stats.earlyCount} sub="17:00 前離" accent={cur.stats.earlyCount > 0 ? "var(--orange)" : undefined} />
+                      <StatCard label="早班" value={cur.stats.早班} accent="#f59e0b" />
+                      <StatCard label="中班" value={cur.stats.中班} accent="#8b5cf6" />
+                      <StatCard label="晚班" value={cur.stats.晚班} accent="#6366f1" />
+                      <StatCard label="遲到" value={cur.stats.lateCount} sub="依班別" accent={cur.stats.lateCount > 0 ? "var(--orange)" : undefined} />
+                      <StatCard label="早退" value={cur.stats.earlyCount} sub="早班 17:00 前" accent={cur.stats.earlyCount > 0 ? "var(--orange)" : undefined} />
                       <StatCard label="平均工時" value={cur.stats.avgWorkHours} sub="小時/天" />
                     </div>
 
                     <div style={{ background: "var(--card-bg)", borderRadius: 10, border: "1px solid var(--border)", overflow: "hidden" }}>
                       <div className="drow" style={{ fontWeight: 600, fontSize: 12, color: "var(--text-muted)", borderBottom: "1px solid var(--border)" }}>
-                        <div>日期</div><div>狀態</div><div>刷卡時間</div>
+                        <div>日期</div><div>狀態</div><div>班別</div><div>刷卡時間</div>
                       </div>
                       {[...cur.days].sort((a, b) => a.date.localeCompare(b.date)).map((d, i) => {
                         const dt = new Date(d.date.replace(/\//g, "-"));
@@ -305,6 +337,7 @@ export default function AttendanceReport() {
                               {short} <span style={{ fontSize: 11, color: "var(--text-muted)" }}>{dayStr}</span>
                             </div>
                             <div><StatusBadge status={d.status} /></div>
+                            <div>{d.shift ? <ShiftBadge shift={d.shift} /> : null}</div>
                             <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 13, color: "var(--text-muted)" }}>
                               {d.times.length > 0 ? d.times.map((t, j) => (
                                 <span key={j} style={{
